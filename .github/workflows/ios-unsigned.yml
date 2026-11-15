@@ -1,0 +1,117 @@
+name: Build iOS IPA for TrollStore
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-unsigned-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-ios:
+    runs-on: xcode-27
+    timeout-minutes: 60
+    env:
+      COCOAPODS_DISABLE_STATS: 'true'
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Report build environment
+        run: |
+          xcodebuild -version
+          uname -m
+          df -h .
+          git rev-parse HEAD
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version-file: pubspec.yaml
+          cache: false
+
+      - name: Install native build tools
+        run: |
+          for tool in cmake ninja pod; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              case "$tool" in
+                pod) brew install cocoapods ;;
+                *) brew install "$tool" ;;
+              esac
+            fi
+          done
+          cmake --version
+          ninja --version
+          pod --version
+
+      - name: Use a separate application identifier
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import plistlib
+          project = Path('ios/Runner.xcodeproj/project.pbxproj')
+          original = project.read_text()
+          if 'PRODUCT_BUNDLE_IDENTIFIER = com.example.kazumi;' not in original:
+              raise SystemExit('Unexpected bundle identifier; review before building')
+          project.write_text(original.replace('com.example.kazumi', 'io.github.nothinghhhhh.kazumiplus'))
+          info = Path('ios/Runner/Info.plist')
+          data = plistlib.loads(info.read_bytes())
+          data['CFBundleDisplayName'] = 'Kazumi Plus'
+          data['CFBundleName'] = 'Kazumi Plus'
+          info.write_bytes(plistlib.dumps(data, sort_keys=False))
+          PY
+
+      - name: Fetch Flutter dependencies
+        run: flutter pub get
+
+      - name: Build iOS release without Apple signing
+        run: |
+          set -o pipefail
+          flutter build ios --release --no-codesign 2>&1 | tee ios-build.log
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          mkdir -p package/Payload dist
+          cp -R build/ios/iphoneos/Runner.app package/Payload/Runner.app
+          if [ -d package/Payload/Runner.app/Frameworks ]; then
+            while IFS= read -r -d '' framework; do
+              codesign --force --sign - --preserve-metadata=identifier,entitlements "$framework"
+            done < <(find package/Payload/Runner.app/Frameworks -type d -name '*.framework' -print0)
+          fi
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' package/Payload/Runner.app/Info.plist
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' package/Payload/Runner.app/Info.plist
+          (cd package && zip -q -r ../dist/Kazumi-Plus-ios-unsigned.ipa Payload)
+          shasum -a 256 dist/Kazumi-Plus-ios-unsigned.ipa > dist/SHA256SUMS.txt
+          {
+            printf 'Source commit: '
+            git rev-parse HEAD
+            flutter --version
+            xcodebuild -version
+            printf '\nUnsigned build for installation with TrollStore.\n'
+          } > dist/build-info.txt
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kazumi-Plus-iOS-TrollStore
+          path: dist/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-log
+          path: ios-build.log
+          if-no-files-found: ignore
+          retention-days: 3
